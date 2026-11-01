@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import onnxruntime
 from insightface import model_zoo
+from insightface.utils import face_align
 from lib.schemas import EmbeddingRecord, FaceDetection, PredictResult, AlignedFace
 from lib.storage.base import EmbeddingStoreProtocol
 import os 
@@ -147,7 +148,36 @@ class FaceService:
         Crop using box (x1, y1, x2, y2) and run FaceAnalysis on the crop.
         Return an AlignedFace object.
         """
-        raise NotImplementedError("Not implemented")
+        if self.detector is None:
+            raise ValueError("No face detector loaded: set DETECTOR_MODEL_NAME.")
+        x1, y1, x2, y2 = box
+        height, width = image.shape[:2]
+        # Landmarks are more precise with context around the face than on the tight box
+        mx = int(round((x2 - x1) * self.align_margin))
+        my = int(round((y2 - y1) * self.align_margin))
+        cx1, cy1, cx2, cy2 = self._clip_xyxy(x1 - mx, y1 - my, x2 + mx, y2 + my, height, width)
+        dets, kpss = self.detector.detect(image[cy1:cy2, cx1:cx2])
+
+        kps = None
+        if len(dets) and kpss is not None:
+            # The crop may contain neighbouring faces: keep the one matching the box
+            ref = np.array([x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1], dtype=np.float32)
+            ious = [self._iou(det[:4], ref) for det in dets]
+            best = int(np.argmax(ious))
+            if ious[best] > 0:
+                kps = kpss[best] + np.array([cx1, cy1], dtype=np.float32)
+
+        if kps is None:
+            logger.warning(f"No landmarks found for box {box}: using unaligned resized crop.")
+            face_img = cv2.resize(image[y1:y2, x1:x2], (self.face_size, self.face_size))
+            return AlignedFace(bbox=box, keypoints=None, image=face_img)
+
+        face_img = face_align.norm_crop(image, kps, image_size=self.face_size)
+        return AlignedFace(
+            bbox=box,
+            keypoints=kps - np.array([x1, y1], dtype=np.float32),
+            image=face_img,
+        )
 
     def extract_embedding_from_face(self, face: AlignedFace) -> list[float]:
         """
