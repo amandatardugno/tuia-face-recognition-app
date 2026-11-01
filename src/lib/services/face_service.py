@@ -184,7 +184,26 @@ class FaceService:
         Extract embedding from face.
         Return a list of floats representing the embedding of the face.
         """
-        raise NotImplementedError("Not implemented")
+        blob = self.preprocess_face(face.image)
+        if isinstance(self.model, onnxruntime.InferenceSession):
+            input_name = self.model.get_inputs()[0].name
+            emb = self.model.run(None, {input_name: blob})[0]
+        else:
+            self.model.eval()
+            with torch.no_grad():
+                emb = self.model(torch.from_numpy(blob)).cpu().numpy()
+        emb = np.asarray(emb, dtype=np.float32).reshape(-1)
+        norm = np.linalg.norm(emb)
+        if norm > 0:
+            emb = emb / norm
+        return emb.astype(float).tolist()
+
+    @staticmethod
+    def preprocess_face(face_bgr: np.ndarray) -> np.ndarray:
+        """Aligned BGR uint8 face -> (1, 3, H, W) float32 RGB blob scaled to [-1, 1] (ArcFace convention)."""
+        rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+        rgb = (rgb - 127.5) / 127.5
+        return np.ascontiguousarray(rgb.transpose(2, 0, 1)[None])
         
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         denom = np.linalg.norm(a) * np.linalg.norm(b)
