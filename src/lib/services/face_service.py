@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import torch
 import onnxruntime
+from insightface import model_zoo
 from lib.schemas import EmbeddingRecord, FaceDetection, PredictResult, AlignedFace
 from lib.storage.base import EmbeddingStoreProtocol
 import os 
@@ -90,7 +91,17 @@ class FaceService:
         """
         if detector_path is None:
             return None
-        return self._load_model(detector_path)
+        if not Path(detector_path).exists():
+            raise ValueError(f"Detector path does not exist: {detector_path}")
+        # SCRFD (e.g. det_10g.onnx from buffalo_l) wrapped by InsightFace: handles
+        # resizing to det_input_size, score threshold, NMS and the 5 keypoints.
+        detector = model_zoo.get_model(str(detector_path))
+        detector.prepare(
+            ctx_id=-1,
+            input_size=(self.det_input_size, self.det_input_size),
+            det_thresh=self.det_score_threshold,
+        )
+        return detector
 
     def _load_image(self, source_path: str) -> np.ndarray:
         image = cv2.imread(source_path)
@@ -113,7 +124,20 @@ class FaceService:
         Each box is (x1, y1, x2, y2) in pixels (InsightFace convention).
         Return a list of tuples with the coordinates of the faces detected in the image.
         """
-        raise NotImplementedError("Not implemented")
+        if self.detector is None:
+            raise ValueError("No face detector loaded: set DETECTOR_MODEL_NAME.")
+        height, width = image.shape[:2]
+        dets, _ = self.detector.detect(image)
+        boxes: list[tuple[int, int, int, int]] = []
+        for x1, y1, x2, y2, _score in dets:
+            box = self._clip_xyxy(
+                int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2)),
+                height, width,
+            )
+            if min(box[2] - box[0], box[3] - box[1]) < self.min_face_size:
+                continue
+            boxes.append(box)
+        return boxes
 
 
     def align_face(
