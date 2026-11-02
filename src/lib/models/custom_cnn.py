@@ -85,7 +85,7 @@ class ArcFaceHead(nn.Module):
     angle of the true class: scale * cos(theta + margin).
     """
 
-    def __init__(self, embedding_dim: int, num_classes: int, scale: float = 30.0, margin: float = 0.5) -> None:
+    def __init__(self, embedding_dim: int, num_classes: int, scale: float = 64.0, margin: float = 0.5) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.empty(num_classes, embedding_dim))
         nn.init.xavier_uniform_(self.weight)
