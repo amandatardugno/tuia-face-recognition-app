@@ -37,8 +37,11 @@ tuia-face-recognition-app/
 │       ├── api.py               # Endpoints /upload, /insert, /predict, /status, /files
 │       ├── config.py            # Configuración vía .env
 │       ├── schemas.py
+│       ├── models/
+│       │   ├── custom_cnn.py    # CNN custom (Modelo A) y exportación a ONNX
+│       │   └── augmentation.py  # Augmentation para entrenar la CNN
 │       ├── services/
-│       │   ├── face_service.py  # ⚠️ Funciones a implementar
+│       │   ├── face_service.py  # Detección, alineación y embeddings (implementado)
 │       │   └── task_manager.py
 │       └── storage/
 │           ├── base.py
@@ -169,37 +172,54 @@ No hardcodeen parámetros: configúrenlos mediante `.env`.
 - Persistencia configurable en JSON o en PostgreSQL + pgvector (`USE_PGVECTOR`).
 - Frontend para registrar identidades, predecir y visualizar los resultados (cajas, etiquetas y keypoints).
 
-### A implementar por el grupo (`src/lib/services/face_service.py`)
+### Implementado por el grupo (`src/lib/services/face_service.py`)
 
-Estas funciones hoy lanzan `NotImplementedError`:
+1. `_load_detector`: carga el detector SCRFD (`DETECTOR_MODEL_NAME=det_10g.onnx`) con `insightface.model_zoo`, una sola vez, configurado con `DET_INPUT_SIZE` y `DET_SCORE_THRESHOLD`. Se sobrescribe porque el detector viene de una librería; se usa `model_zoo` en lugar de `FaceAnalysis` para que el modelo se tome de `models/` y se configure por `.env`.
+2. `detect_faces`: detecta con SCRFD y devuelve las cajas `(x1, y1, x2, y2)` en píxeles enteros, recortadas con `_clip_xyxy` y filtradas por `MIN_FACE_SIZE`. Sin caras, devuelve `[]`.
+3. `align_face`: recorta la caja con un margen de `ALIGN_MARGIN`, vuelve a correr SCRFD sobre el recorte para obtener los 5 puntos de la cara (si hay varias, la de mayor IoU con la caja) y alinea con `insightface.utils.face_align.norm_crop` a `FACE_SIZE`. Los keypoints se devuelven relativos a la esquina de la caja. Si no se encuentran puntos, devuelve el recorte redimensionado con `keypoints=None` y deja un warning.
+4. `extract_embedding_from_face`: preprocesa con `FaceService.preprocess_face` (BGR → RGB, `(x − 127,5) / 127,5`, CHW), corre el modelo (`onnxruntime` para `.onnx`, `torch` para `.pth`) y devuelve el embedding normalizado L2 como `list[float]` de `EMBEDDING_DIM` valores.
 
-1. `detect_faces`: detección de rostros. Devuelve las cajas `(x1, y1, x2, y2)`.
-2. `align_face`: alineación con landmarks y normalización a `FACE_SIZE`. Devuelve un `AlignedFace`.
-3. `extract_embedding_from_face`: extracción del embedding de dimensión `EMBEDDING_DIM`, normalizado L2.
-
-Ver detalles y recomendaciones en [ENUNCIADO.md](ENUNCIADO.md#4-parte-3--integración-en-la-aplicación).
+Código agregado para las notebooks: `src/lib/models/custom_cnn.py` (la CNN custom, sus cabezas de entrenamiento y la exportación a ONNX) y `src/lib/models/augmentation.py` (la augmentation del entrenamiento).
 
 ## Modelo y fine-tuning
 
-Completar en la entrega final:
+**Modelos (link público de solo lectura):** https://drive.google.com/drive/folders/1ruWQ6GBKVxtDvGqGszbYETTPRP6PxotC?usp=sharing. Copiar los `.onnx` a `models/`; el `LEEME.txt` de la carpeta tiene la fuente, la licencia y los sha256 de cada archivo.
 
-- Modelo elegido y link público de descarga
-- Arquitectura (ResNet, EfficientNet, ViT, CNN custom, etc.)
-- Justificación técnica y trade-offs frente al modelo descartado
-- Hiperparámetros y proceso de entrenamiento / fine-tuning
-- Umbral de similitud elegido y cómo se calibró
-- Análisis de errores (FP/FN)
-- Métricas: accuracy, precision, recall, AUC/EER
+**Modelo elegido: ArcFace preentrenado** (`w600k_r50.onnx`, paquete `buffalo_l` de InsightFace): una ResNet-50 entrenada con la pérdida ArcFace sobre WebFace600K, con embedding de 512 dimensiones, usada sin reentrenar, junto con el detector SCRFD (`det_10g.onnx`). Licencia de InsightFace: uso no comercial y de investigación.
+
+**Modelo comparado: CNN custom** (`cnn_custom.onnx`, `src/lib/models/custom_cnn.py`): 4 bloques convolucionales (dos convoluciones 3×3 con BatchNorm y ReLU, y max pooling), global average pooling, Dropout 0,2 y una capa lineal a 512 con BatchNorm; 1,3 millones de parámetros. Se entrenó desde cero sobre 90 personas de Pins, con dos cabezas: softmax y ArcFace (s = 64, m = 0,5). Hiperparámetros: SGD con momentum 0,9, lr 0,1 con cosine annealing, weight decay 5e-4, lotes de 128, hasta 40 épocas con early stopping (paciencia 5) y el mejor checkpoint según el acierto en validación; augmentation solo en train. Se exportó la de softmax, por mayor AUC en la validación de LFW.
+
+**Resultados** (personas que la CNN no vio; detalle en `2-train.ipynb`):
+
+| Métrica (`lfw_test`) | ArcFace preentrenado | CNN custom (softmax) |
+|---|---|---|
+| AUC | 0,9998 | 0,948 |
+| EER | 0,0010 | 0,123 |
+| TAR @ FAR = 1e-3 | 0,999 | 0,301 |
+| Top-1 / Top-5 | 1,000 / 1,000 | 0,569 / 0,789 |
+| Precisión / recall / F1 macro | 0,564 / 0,999 / 0,681 | 0,416 / 0,477 / 0,379 |
+| Exactitud en los pares oficiales de LFW | 0,9985 | 0,879 |
+| Tamaño / parámetros | 174 MB / 43,6 M | 5,2 MB / 1,3 M |
+| Tiempo por cara en CPU | 65 ms | 3,8 ms |
+
+La CNN rinde mucho menos por los datos (90 personas contra unas 600.000), la capacidad (30 veces menos parámetros) y la pérdida (la cabeza ArcFace quedó subentrenada). Sus falsos positivos muestran que aprendió rasgos generales (edad, origen, anteojos) más que identidades, y sus falsos negativos son fotos con gorras o anteojos de sol. Los peores falsos negativos de ArcFace resultaron ser errores de etiqueta de LFW.
+
+**Umbral:** `SIMILARITY_THRESHOLD=0.201` (coseno), calibrado en la validación de LFW como el que deja pasar 1 de cada 1.000 pares de personas distintas (FAR = 1e-3), con un FRR de 0,0001. El EER, que se usó como control, da 0,245. En identificación con galerías grandes, ese umbral acepta más desconocidos (por la cantidad de comparaciones); con las pocas personas que se registran en la app, el efecto es chico.
 
 ## Dataset
 
-Documentar:
+Dos datasets públicos, combinados (detalle en `1-pre-processing.ipynb`):
 
-- Fuente de las imágenes (propias y/o públicas) y su licencia
-- Cantidad por clase/persona
-- Balance de clases
-- Variaciones (iluminación, pose, expresión)
-- Reglas de filtrado y calidad
+- **Pins Face Recognition** (Kaggle, fotos de Pinterest; la licencia no se pudo verificar): 105 celebridades y 17.534 fotos (de 86 a 237 por persona, casi balanceado). Se usa para entrenar la CNN: 90 personas sorteadas para train y validación (85/15 por persona) y 15 como test del mismo dominio.
+- **LFW** (Huang et al., 2007, uso académico): 5.749 personas y 13.233 fotos de prensa, muy desbalanceado (el 71% tiene una sola foto). Se usa para calibrar el umbral y evaluar: dividido por persona entre validación y test, más los pares oficiales. Las 15 personas que también están en Pins se sacaron de LFW.
+- **Variaciones:** Pins tiene recortes ajustados y más variación de pose, maquillaje y edición, con un 7,2% de fotos en gris; LFW tiene la cara más chica y centrada, con fondo y a veces otras caras.
+- **Preprocesamiento:** se agrega un borde reflejado del 25% antes de detectar (sin él, en Pins no se detecta el 90% de las caras) y se usan la detección y la alineación de la app.
+- **Reglas de calidad:** se descartan las fotos sin cara (60), sin puntos para alinear (5), los duplicados de la misma persona (632, coseno > 0,95), las fotos con dos nombres (12), las caras que se parecen más a otra persona (21) y las personas de LFW cargadas con dos nombres (56 personas). No se descarta por tamaño, foco ni exposición: los datos mostraron que esas caras se reconocen, y un umbral de brillo habría descartado sobre todo a personas de piel oscura.
+- **Resultado:** 16.851 caras de 105 personas de Pins y 13.015 caras de 5.669 personas de LFW, sin fuga entre conjuntos.
+
+## Notebooks
+
+Las dos notebooks están ejecutadas. Para volver a correrlas hace falta, además de `requirements.txt`, `pip install ipykernel` (y `nbformat`/`nbclient` para ejecutarlas por consola). Los datos no se versionan y van en `data/`: Pins se descarga de Kaggle (dataset "Pins Face Recognition") y se descomprime como `data/105_classes_pins_dataset/`; LFW se baja del espejo que usa `scikit-learn` (`https://ndownloader.figshare.com/files/5976018`, que se extrae como `data/lfw/`, y los pares oficiales de `https://ndownloader.figshare.com/files/5976006` en `data/raw/lfw_pairs/pairs.txt`). `1-pre-processing.ipynb` genera en `data/intermedios/` los splits que usa `2-train.ipynb`. La detección de todas las fotos y el entrenamiento se hicieron en GPU (RTX 3060); en CPU funcionan, pero tardan horas.
 
 ## Notas importantes
 
