@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 import torch
 import onnxruntime
+from insightface import model_zoo
+from insightface.utils import face_align
 from lib.schemas import EmbeddingRecord, FaceDetection, PredictResult, AlignedFace
 from lib.storage.base import EmbeddingStoreProtocol
 import os 
@@ -90,7 +92,17 @@ class FaceService:
         """
         if detector_path is None:
             return None
-        return self._load_model(detector_path)
+        if not Path(detector_path).exists():
+            raise ValueError(f"Detector path does not exist: {detector_path}")
+        # SCRFD (e.g. det_10g.onnx from buffalo_l) wrapped by InsightFace: handles
+        # resizing to det_input_size, score threshold, NMS and the 5 keypoints.
+        detector = model_zoo.get_model(str(detector_path))
+        detector.prepare(
+            ctx_id=-1,
+            input_size=(self.det_input_size, self.det_input_size),
+            det_thresh=self.det_score_threshold,
+        )
+        return detector
 
     def _load_image(self, source_path: str) -> np.ndarray:
         image = cv2.imread(source_path)
@@ -113,7 +125,20 @@ class FaceService:
         Each box is (x1, y1, x2, y2) in pixels (InsightFace convention).
         Return a list of tuples with the coordinates of the faces detected in the image.
         """
-        raise NotImplementedError("Not implemented")
+        if self.detector is None:
+            raise ValueError("No face detector loaded: set DETECTOR_MODEL_NAME.")
+        height, width = image.shape[:2]
+        dets, _ = self.detector.detect(image)
+        boxes: list[tuple[int, int, int, int]] = []
+        for x1, y1, x2, y2, _score in dets:
+            box = self._clip_xyxy(
+                int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2)),
+                height, width,
+            )
+            if min(box[2] - box[0], box[3] - box[1]) < self.min_face_size:
+                continue
+            boxes.append(box)
+        return boxes
 
 
     def align_face(
@@ -123,14 +148,62 @@ class FaceService:
         Crop using box (x1, y1, x2, y2) and run FaceAnalysis on the crop.
         Return an AlignedFace object.
         """
-        raise NotImplementedError("Not implemented")
+        if self.detector is None:
+            raise ValueError("No face detector loaded: set DETECTOR_MODEL_NAME.")
+        x1, y1, x2, y2 = box
+        height, width = image.shape[:2]
+        # Landmarks are more precise with context around the face than on the tight box
+        mx = int(round((x2 - x1) * self.align_margin))
+        my = int(round((y2 - y1) * self.align_margin))
+        cx1, cy1, cx2, cy2 = self._clip_xyxy(x1 - mx, y1 - my, x2 + mx, y2 + my, height, width)
+        dets, kpss = self.detector.detect(image[cy1:cy2, cx1:cx2])
+
+        kps = None
+        if len(dets) and kpss is not None:
+            # The crop may contain neighbouring faces: keep the one matching the box
+            ref = np.array([x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1], dtype=np.float32)
+            ious = [self._iou(det[:4], ref) for det in dets]
+            best = int(np.argmax(ious))
+            if ious[best] > 0:
+                kps = kpss[best] + np.array([cx1, cy1], dtype=np.float32)
+
+        if kps is None:
+            logger.warning(f"No landmarks found for box {box}: using unaligned resized crop.")
+            face_img = cv2.resize(image[y1:y2, x1:x2], (self.face_size, self.face_size))
+            return AlignedFace(bbox=box, keypoints=None, image=face_img)
+
+        face_img = face_align.norm_crop(image, kps, image_size=self.face_size)
+        return AlignedFace(
+            bbox=box,
+            keypoints=kps - np.array([x1, y1], dtype=np.float32),
+            image=face_img,
+        )
 
     def extract_embedding_from_face(self, face: AlignedFace) -> list[float]:
         """
         Extract embedding from face.
         Return a list of floats representing the embedding of the face.
         """
-        raise NotImplementedError("Not implemented")
+        blob = self.preprocess_face(face.image)
+        if isinstance(self.model, onnxruntime.InferenceSession):
+            input_name = self.model.get_inputs()[0].name
+            emb = self.model.run(None, {input_name: blob})[0]
+        else:
+            self.model.eval()
+            with torch.no_grad():
+                emb = self.model(torch.from_numpy(blob)).cpu().numpy()
+        emb = np.asarray(emb, dtype=np.float32).reshape(-1)
+        norm = np.linalg.norm(emb)
+        if norm > 0:
+            emb = emb / norm
+        return emb.astype(float).tolist()
+
+    @staticmethod
+    def preprocess_face(face_bgr: np.ndarray) -> np.ndarray:
+        """Aligned BGR uint8 face -> (1, 3, H, W) float32 RGB blob scaled to [-1, 1] (ArcFace convention)."""
+        rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+        rgb = (rgb - 127.5) / 127.5
+        return np.ascontiguousarray(rgb.transpose(2, 0, 1)[None])
         
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         denom = np.linalg.norm(a) * np.linalg.norm(b)
